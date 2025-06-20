@@ -1,141 +1,165 @@
-import pandas as pd, numpy as np, ccxt, time, math, requests, os
-from datetime import datetime, timedelta
+# bot_trading_sol_combo.py (swing + scalping inteligente refinado)
+
+import ccxt
+import pandas as pd
+import numpy as np
+import time, os, requests
+from datetime import datetime
 from dotenv import load_dotenv
 
-# Cargar variables .env
+# === CONFIGURACIÓN ===
 load_dotenv()
 API_KEY = os.getenv("BINANCE_KEY")
 API_SECRET = os.getenv("BINANCE_SECRET")
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Configuración del bot
-symbol = "AEUR/USDT"
-DONCHIAN_N = 10
-STOP_MULT   = 2.0
-TP_MULT     = 1.26
-RISK_PCT    = 0.029
-SLIPPAGE    = 0.0002
-FEE         = 0.001
-capital = 280
-profit_24h = 0
-last_report_time = datetime.now()
+SYMBOL = "SOL/FDUSD"
+TIMEFRAME = "1m"
+CAPITAL = 280
+MAX_POSITIONS = 4
+RISK_PCT = 0.05  # ajustado para menor riesgo
+TRAIL_TRIGGER = 0.0025
+TRAIL_GAP = 0.0010
 
-# Inicializar Binance
-exchange = ccxt.binance({
-    "apiKey": API_KEY,
-    "secret": API_SECRET,
-    "enableRateLimit": True,
-    "options": {"defaultType": "spot"}
-})
+positions_swing = []
+positions_scalp = []
+trailing_active = False
+highest_price = 0
 
-def send_telegram(message):
+
+def send_telegram(msg):
     if not TG_TOKEN or not TG_CHAT_ID:
-        print("[ERROR] Telegram no configurado.")
         return
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    data = {"chat_id": TG_CHAT_ID, "text": message}
     try:
-        requests.post(url, data=data)
-    except Exception as e:
-        print("[Telegram error]", e)
+        requests.post(url, data={"chat_id": TG_CHAT_ID, "text": msg})
+    except:
+        pass
 
-def fetch_ohlcv():
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1m', limit=DONCHIAN_N + 2)
-    df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df.set_index('timestamp', inplace=True)
+
+def fetch_data(limit=120):
+    ohlcv = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=limit)
+    df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
+    df['ts'] = pd.to_datetime(df['ts'], unit='ms')
+    df.set_index('ts', inplace=True)
     return df
 
-def compute_atr(df, period=14):
-    tr = pd.concat([
-        df['high'] - df['low'],
-        (df['high'] - df['close'].shift()).abs(),
-        (df['low'] - df['close'].shift()).abs()
-    ], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
+
+def compute_indicators(df):
+    df['mb'] = df['close'].rolling(14).mean()
+    df['std'] = df['close'].rolling(14).std()
+    df['bb_low'] = df['mb'] - 2.5 * df['std']
+    df['bb_up'] = df['mb'] + 2.5 * df['std']
+    df['ema_fast'] = df['close'].ewm(span=5).mean()
+    df['ema_slow'] = df['close'].ewm(span=21).mean()
+    delta = df['close'].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    rs = gain.ewm(14).mean() / (loss.ewm(14).mean() + 1e-10)
+    df['rsi'] = 100 - 100 / (1 + rs)
+    df['range10'] = df['high'].rolling(10).max() - df['low'].rolling(10).min()
+    df['body'] = abs(df['close'] - df['open'])
+    df['wick_lower'] = df[['open', 'close']].min(axis=1) - df['low']
+    return df
+
 
 def run_bot():
-    global capital, profit_24h, last_report_time
-    position = 0
-    entry_price = stop_price = target_price = 0
-    base_asset = symbol.split("/")[0]
-
-    send_telegram("🤖 Bot REAL AEUR/USDT iniciado ✅")
+    global CAPITAL, positions_swing, positions_scalp, trailing_active, highest_price
+    send_telegram("🤖 Bot combinado SOL swing + scalping refinado iniciado")
 
     while True:
         try:
-            df = fetch_ohlcv()
-            df['ATR'] = compute_atr(df)
-
+            df = fetch_data()
+            df = compute_indicators(df)
             last = df.iloc[-1]
-            high_channel = df['high'].rolling(DONCHIAN_N).max().iloc[-2]
-            now = datetime.now()
-            now_str = now.strftime('%Y-%m-%d %H:%M:%S')
+            price = last['close']
+            hour = last.name.hour
+            vol_avg = df['volume'].iloc[-20:].mean()
+            vol_curr = last['volume']
 
-            price_now = last['close']
+            if not (4 <= hour <= 9):
+                time.sleep(60)
+                continue
 
-            if position == 0:
-                if last['high'] > high_channel and not math.isnan(last['ATR']):
-                    risk_usd = capital * RISK_PCT
-                    qty = risk_usd / price_now
-                    entry_price = price_now * (1 + SLIPPAGE)
-                    stop_price  = entry_price - STOP_MULT * last['ATR']
-                    target_price= entry_price + TP_MULT * last['ATR']
+            # === SWING ===
+            if last['range10'] > 0.002 * price:
+                if (last['rsi'] < 33 and last['wick_lower'] > 2 * last['body'] and vol_curr > 1.4 * vol_avg and len(positions_swing) < MAX_POSITIONS):
+                    amount = CAPITAL * RISK_PCT
+                    qty = amount / price
+                    positions_swing.append((price, qty))
+                    CAPITAL -= qty * price
+                    send_telegram(f"🟢 COMPRA SWING {qty:.2f} @ {price:.3f}")
 
-                    # Crear orden real de mercado
-                    order = exchange.create_market_buy_order(symbol, qty)
-                    position = float(order['filled'])
+                if (last['ema_fast'] > last['ema_slow'] and df['ema_fast'].iloc[-3] < df['ema_slow'].iloc[-3] and last['close'] > last['bb_up'] and last['rsi'] > 61):
+                    amount = CAPITAL * RISK_PCT
+                    qty = amount / price
+                    positions_swing.append((price, qty))
+                    CAPITAL -= qty * price
+                    send_telegram(f"🚀 BREAKOUT SWING {qty:.2f} @ {price:.3f}")
 
-                    msg = f"""📈 [{now_str}] ENTRADA REAL
-🔹 {position:.2f} AEUR @ {entry_price:.5f}
-🎯 TP: {target_price:.5f} | 🛑 SL: {stop_price:.5f}"""
-                    print(msg); send_telegram(msg)
+                # TP trailing swing
+                if positions_swing:
+                    total_qty = sum(q for _, q in positions_swing)
+                    avg_price = sum(p * q for p, q in positions_swing) / total_qty
+                    gain_pct = (price - avg_price) / avg_price
 
-            elif position > 0:
-                if last['low'] <= stop_price:
-                    exit_price = stop_price * (1 - SLIPPAGE)
-                    pnl = (exit_price - entry_price) * position * (1 - FEE)
-                    exchange.create_market_sell_order(symbol, position)
-                    capital += pnl
-                    profit_24h += pnl
-                    msg = f"""❌ [{now_str}] STOP LOSS REAL
-💸 Salida: {exit_price:.5f}
-📉 Pérdida: {pnl:.2f} USDT
-💰 Capital actual: {capital:.2f}"""
-                    print(msg); send_telegram(msg)
-                    position = 0
+                    if gain_pct >= TRAIL_TRIGGER:
+                        if not trailing_active:
+                            highest_price = price
+                            trailing_active = True
+                            send_telegram("📈 TP swing activado")
+                        elif price > highest_price:
+                            highest_price = price
+                        elif price < highest_price - TRAIL_GAP:
+                            pnl = (price - avg_price) * total_qty
+                            CAPITAL += total_qty * price
+                            positions_swing.clear()
+                            trailing_active = False
+                            send_telegram(f"✅ TP SWING {total_qty:.2f} @ {price:.3f} → +{pnl:.2f} USDT")
 
-                elif last['high'] >= target_price:
-                    exit_price = target_price * (1 - SLIPPAGE)
-                    pnl = (exit_price - entry_price) * position * (1 - FEE)
-                    exchange.create_market_sell_order(symbol, position)
-                    capital += pnl
-                    profit_24h += pnl
-                    msg = f"""✅ [{now_str}] TAKE PROFIT REAL
-🏁 Salida: {exit_price:.5f}
-📈 Ganancia: {pnl:.2f} USDT
-💰 Capital actual: {capital:.2f}"""
-                    print(msg); send_telegram(msg)
-                    position = 0
+                if positions_swing and last['rsi'] > 63:
+                    total_qty = sum(q for _, q in positions_swing)
+                    avg_price = sum(p * q for p, q in positions_swing) / total_qty
+                    pnl = (price - avg_price) * total_qty
+                    CAPITAL += total_qty * price
+                    positions_swing.clear()
+                    trailing_active = False
+                    send_telegram(f"🔴 SL SWING RSI {total_qty:.2f} @ {price:.3f} → PnL: {pnl:.2f} USDT")
 
-            if now - last_report_time > timedelta(hours=24):
-                rpt = (
-                    f"📊 Resumen diario\n"
-                    f"Ganancia/Pérdida últimas 24h: {profit_24h:.2f} USDT\n"
-                    f"Capital actual: {capital:.2f} USDT"
-                )
-                send_telegram(rpt)
-                profit_24h = 0
-                last_report_time = now
+            # === SCALPING ===
+            if last['body'] > 0.003 * price and vol_curr > 1.2 * vol_avg and last['ema_fast'] > last['ema_slow'] and len(positions_scalp) < MAX_POSITIONS:
+                amount = CAPITAL * RISK_PCT
+                qty = amount / price
+                positions_scalp.append((price, qty, price))  # guardamos también highest_price
+                CAPITAL -= qty * price
+                send_telegram(f"⚡ SCALPING ENTRY {qty:.2f} @ {price:.3f}")
 
-            print(f"[{now_str}] Capital actual: {capital:.2f} USDT")
-            time.sleep(15)
+            # TP trailing scalping
+            for i, (entry_price, qty, high) in enumerate(positions_scalp[:]):
+                new_high = max(high, price)
+                gain_pct = (new_high - entry_price) / entry_price
+                if gain_pct >= TRAIL_TRIGGER:
+                    if price < new_high - TRAIL_GAP:
+                        pnl = (price - entry_price) * qty
+                        CAPITAL += qty * price
+                        positions_scalp.pop(i)
+                        send_telegram(f"✅ TP SCALP {qty:.2f} @ {price:.3f} → +{pnl:.2f} USDT")
+                    else:
+                        positions_scalp[i] = (entry_price, qty, new_high)
 
-        except Exception as e:
-            print("[Error en ejecución]", e)
-            send_telegram(f"⚠️ Error: {e}")
             time.sleep(30)
 
+        except Exception as e:
+            send_telegram(f"⚠️ Error: {e}")
+            time.sleep(60)
+
+
 if __name__ == "__main__":
+    exchange = ccxt.binance({
+        'apiKey': API_KEY,
+        'secret': API_SECRET,
+        'enableRateLimit': True,
+        'options': {'defaultType': 'spot'}
+    })
     run_bot()
